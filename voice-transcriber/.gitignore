@@ -1,0 +1,25 @@
+.venv/
+work/
+out/
+.DS_Store
+
+# Audio/video files (personal recordings)
+*.zip
+*.m4a
+*.mp3
+*.wav
+*.aac
+*.flac
+*.ogg
+*.mp4
+*.webm
+*.mkv
+*.caf
+
+# Python cruft
+__pycache__/
+*.pyc
+.python-version
+
+# Logs
+*.log
