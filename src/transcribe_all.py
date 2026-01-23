@@ -4,6 +4,7 @@ import re
 import os
 import json
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
 from faster_whisper import WhisperModel
@@ -12,6 +13,9 @@ AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".mp4", ".webm", 
 
 DT_RE = re.compile(r"^(\d{8}) (\d{6})")
 SEQ_RE = re.compile(r"^(.*?)(?: (\d+))?$")
+
+# Best guess at the local timezone for interpreting filename-based timestamps.
+_LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 
 def parse_dt_from_stem(stem: str):
     m = DT_RE.match(stem)
@@ -70,10 +74,12 @@ def _parse_media_dt(s: str):
             continue
     return None
 
-def media_created_dt(p: Path):
+@lru_cache(maxsize=None)
+def _media_created_dt_cached(path_str: str):
     """
-    Extract creation timestamp from the audio/container metadata via ffprobe.
-    Returns an aware datetime in UTC if available, else None.
+    Extract creation timestamp from the audio/container/stream metadata via ffprobe
+    for the given path string. Returns an aware datetime in UTC if available,
+    else None.
     """
     try:
         cp = subprocess.run(
@@ -87,7 +93,7 @@ def media_created_dt(p: Path):
                 # sometimes stores creation info on the stream.
                 "-show_entries",
                 "format_tags:stream_tags",
-                str(p),
+                path_str,
             ],
             capture_output=True,
             text=True,
@@ -116,6 +122,14 @@ def media_created_dt(p: Path):
         return None
     return None
 
+
+def media_created_dt(p: Path):
+    """
+    Cached wrapper around _media_created_dt_cached so ffprobe is only run
+    once per file path.
+    """
+    return _media_created_dt_cached(str(p))
+
 def iter_audio_files(root: Path):
     for p in root.rglob("*"):
         if not p.is_file():
@@ -134,9 +148,10 @@ def sort_key(p: Path):
     else:
         dt_name = parse_dt_from_stem(p.stem)
         if dt_name is not None:
-            # Treat as local time; convert to UTC-ish ordering by making it naive->UTC
+            # Treat as local time: attach the local tzinfo so display stays at
+            # the clock time implied by the filename.
             priority = 1
-            dt = dt_name.replace(tzinfo=timezone.utc)
+            dt = dt_name.replace(tzinfo=_LOCAL_TZ)
         else:
             priority = 2
             dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
@@ -185,7 +200,8 @@ def main():
             if dt is None:
                 dt = parse_dt_from_stem(p.stem)
                 if dt is not None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    # Treat filename timestamps as local time.
+                    dt = dt.replace(tzinfo=_LOCAL_TZ)
             if dt is None:
                 dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
 
