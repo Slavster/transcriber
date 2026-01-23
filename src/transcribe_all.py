@@ -2,19 +2,119 @@
 import sys
 import re
 import os
+import json
+import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from faster_whisper import WhisperModel
 
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".mp4", ".webm", ".mkv", ".caf"}
 
 DT_RE = re.compile(r"^(\d{8}) (\d{6})")
+SEQ_RE = re.compile(r"^(.*?)(?: (\d+))?$")
 
 def parse_dt_from_stem(stem: str):
     m = DT_RE.match(stem)
     if not m:
         return None
     return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+
+
+def parse_name_sequence(stem: str) -> tuple[str, int]:
+    """
+    Split a filename stem like 'Ho Xuan Huong 3' into:
+      ('Ho Xuan Huong', 3)
+    and a stem like 'Ho Xuan Huong' into:
+      ('Ho Xuan Huong', 0)
+
+    This lets us order related files in a natural conversational sequence,
+    even when their timestamps are identical to-the-second (e.g., after
+    Airdrop or batch export).
+    """
+    m = SEQ_RE.match(stem)
+    if not m:
+        return stem, 0
+    base = (m.group(1) or "").strip()
+    num_str = m.group(2)
+    try:
+        idx = int(num_str) if num_str is not None else 0
+    except ValueError:
+        idx = 0
+    return base, idx
+
+def _parse_media_dt(s: str):
+    """
+    Parse common ffprobe datetime tag formats like:
+      - 2026-01-13T13:10:24Z
+      - 2026-01-13T13:10:24.000000Z
+      - 2026-01-13 13:10:24
+    Returns an aware datetime in UTC when possible.
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    # ISO 8601 (most common from ffprobe)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    # Fallback: space-separated
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            continue
+    return None
+
+def media_created_dt(p: Path):
+    """
+    Extract creation timestamp from the audio/container metadata via ffprobe.
+    Returns an aware datetime in UTC if available, else None.
+    """
+    try:
+        cp = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                # Ask for both container-level and stream-level tags; Voice Memos
+                # sometimes stores creation info on the stream.
+                "-show_entries",
+                "format_tags:stream_tags",
+                str(p),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cp.returncode != 0:
+            return None
+        data = json.loads(cp.stdout or "{}")
+        tag_dicts = []
+        fmt = data.get("format") or {}
+        if isinstance(fmt, dict):
+            tag_dicts.append(fmt.get("tags") or {})
+        # Also inspect each stream's tags – these often carry per-recording timestamps.
+        for stream in data.get("streams") or []:
+            if isinstance(stream, dict):
+                tag_dicts.append(stream.get("tags") or {})
+
+        # Common keys across containers; Apple / Voice Memos often use quicktime creationdate.
+        for tags in tag_dicts:
+            for k in ("creation_time", "com.apple.quicktime.creationdate", "date"):
+                v = tags.get(k)
+                dt = _parse_media_dt(v) if isinstance(v, str) else None
+                if dt is not None:
+                    return dt
+    except Exception:
+        return None
+    return None
 
 def iter_audio_files(root: Path):
     for p in root.rglob("*"):
@@ -26,11 +126,24 @@ def iter_audio_files(root: Path):
             yield p
 
 def sort_key(p: Path):
-    dt = parse_dt_from_stem(p.stem)
-    if dt is not None:
-        return (0, dt, p.name)
-    # fallback: mtime
-    return (1, datetime.fromtimestamp(p.stat().st_mtime), p.name)
+    # Prefer true media creation time (from metadata), then filename dt, then filesystem mtime.
+    dt_media = media_created_dt(p)
+    if dt_media is not None:
+        priority = 0
+        dt = dt_media
+    else:
+        dt_name = parse_dt_from_stem(p.stem)
+        if dt_name is not None:
+            # Treat as local time; convert to UTC-ish ordering by making it naive->UTC
+            priority = 1
+            dt = dt_name.replace(tzinfo=timezone.utc)
+        else:
+            priority = 2
+            dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+
+    base_name, seq_idx = parse_name_sequence(p.stem)
+    # Order by (source of time, timestamp, conversational base name, sequence index, full filename)
+    return (priority, dt, base_name, seq_idx, p.name)
 
 def main():
     if len(sys.argv) < 3:
@@ -55,6 +168,9 @@ def main():
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
     combined_path = out_root / "ALL_TRANSCRIPTS.txt"
+    # For display, we keep a per-second counter so files that truly share the
+    # same wall-clock second get a stable suffix like :2, :3, etc.
+    counts_by_second: dict[datetime, int] = {}
     with combined_path.open("w", encoding="utf-8") as allf:
         for p in files:
             # Transcribe: auto language detection
@@ -64,12 +180,29 @@ def main():
             per_file = transcripts_dir / f"{p.stem}.txt"
             per_file.write_text(text + "\n", encoding="utf-8")
 
-            # Header uses parsed dt if available, else file mtime
-            dt = parse_dt_from_stem(p.stem)
+            # Header uses media creation time if available, else filename dt, else file mtime
+            dt = media_created_dt(p)
             if dt is None:
-                dt = datetime.fromtimestamp(p.stat().st_mtime)
+                dt = parse_dt_from_stem(p.stem)
+                if dt is not None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            if dt is None:
+                dt = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
 
-            allf.write(f"\n===== {dt.strftime('%Y-%m-%d %H:%M:%S')} | {p.name} | lang={info.language} =====\n")
+            # Localized time for display plus a tie-break suffix if multiple files
+            # share the exact same second.
+            dt_local = dt.astimezone()
+            key = dt_local.replace(microsecond=0)
+            count = counts_by_second.get(key, 0) + 1
+            counts_by_second[key] = count
+
+            ts_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+            if count > 1:
+                ts_str = f"{ts_str}:{count}"
+
+            allf.write(
+                f"\n===== {ts_str} | {p.name} | lang={info.language} =====\n"
+            )
             allf.write(text + "\n")
 
     print(f"Files transcribed: {len(files)}")
